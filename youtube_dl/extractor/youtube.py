@@ -27,6 +27,7 @@ from ..compat import (
 )
 from ..jsinterp import JSInterpreter
 from ..utils import (
+    bug_reports_message,
     clean_html,
     dict_get,
     error_to_compat_str,
@@ -65,6 +66,7 @@ from ..utils import (
     url_or_none,
     urlencode_postdata,
     urljoin,
+    variadic,
 )
 
 
@@ -85,6 +87,22 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
     _PLAYLIST_ID_RE = r'(?:(?:PL|LL|EC|UU|FL|RD|UL|TL|PU|OLAK5uy_)[0-9A-Za-z-_]{10,}|RDMM)'
 
     _INNERTUBE_CLIENTS = {
+        'ios': {
+            'INNERTUBE_CONTEXT': {
+                'client': {
+                    'clientName': 'IOS',
+                    'clientVersion': '19.45.4',
+                    'deviceMake': 'Apple',
+                    'deviceModel': 'iPhone16,2',
+                    'userAgent': 'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)',
+                    'osName': 'iPhone',
+                    'osVersion': '18.1.0.22B83',
+                },
+            },
+            'INNERTUBE_CONTEXT_CLIENT_NAME': 5,
+            'REQUIRE_JS_PLAYER': False,
+            'REQUIRE_PO_TOKEN': True,
+        },
         # mweb has 'ultralow' formats
         # See: https://github.com/yt-dlp/yt-dlp/pull/557
         'mweb': {
@@ -110,11 +128,23 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
             'INNERTUBE_CONTEXT_CLIENT_NAME': 7,
             'SUPPORTS_COOKIES': True,
         },
+        'web': {
+            'INNERTUBE_CONTEXT': {
+                'client': {
+                    'clientName': 'WEB',
+                    'clientVersion': '2.20241126.01.00',
+                },
+            },
+            'INNERTUBE_CONTEXT_CLIENT_NAME': 1,
+            'REQUIRE_PO_TOKEN': True,
+            'SUPPORTS_COOKIES': True,
+        },
     }
 
     def _login(self):
         """
         Attempt to log in to YouTube.
+
         True is returned if successful or skipped.
         False is returned if login failed.
 
@@ -431,6 +461,26 @@ class YoutubeBaseInfoExtractor(InfoExtractor):
             'view_count': view_count,
             'uploader': uploader,
         }
+
+    @staticmethod
+    def _extract_thumbnails(data, *path_list, **kw_final_key):
+        """
+        Extract thumbnails from thumbnails dict
+        @param path_list: path list to level that contains 'thumbnails' key
+        """
+        final_key = kw_final_key.get('final_key', 'thumbnails')
+
+        return traverse_obj(data, ((
+            tuple(variadic(path) + (final_key, Ellipsis)
+                  for path in path_list or [()])), {
+            'url': ('url', T(url_or_none),
+                    # Sometimes youtube gives a wrong thumbnail URL. See:
+                    # https://github.com/yt-dlp/yt-dlp/issues/233
+                    # https://github.com/ytdl-org/youtube-dl/issues/28023
+                    T(lambda u: update_url(u, query=None) if u and 'maxresdefault' in u else u)),
+            'height': ('height', T(int_or_none)),
+            'width': ('width', T(int_or_none)),
+        }, T(lambda t: t if t.get('url') else None)))
 
     def _search_results(self, query, params):
         data = {
@@ -1995,6 +2045,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             player_response = self._extract_yt_initial_variable(
                 webpage, self._YT_INITIAL_PLAYER_RESPONSE_RE,
                 video_id, 'initial player response')
+        is_live = traverse_obj(player_response, ('videoDetails', 'isLive'))
+
         if False and not player_response:
             player_response = self._call_api(
                 'player', {'videoId': video_id}, video_id)
@@ -2008,50 +2060,73 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
             if sts:
                 pb_context['signatureTimestamp'] = sts
 
-            client = traverse_obj(self._INNERTUBE_CLIENTS, (
-                lambda _, v: not v.get('REQUIRE_PO_TOKEN')),
-                get_all=False)
+            client_names = traverse_obj(self._INNERTUBE_CLIENTS, (
+                T(dict.items), lambda _, k_v: not k_v[1].get('REQUIRE_PO_TOKEN'),
+                0))[:1]
+            if 'web' not in client_names:
+                # webpage links won't download: ignore links and playability
+                player_response = filter_dict(
+                    player_response or {},
+                    lambda k, _: k not in ('streamingData', 'playabilityStatus'))
 
-            query = {
-                'playbackContext': {
-                    'contentPlaybackContext': pb_context,
-                    'contentCheckOk': True,
-                    'racyCheckOk': True,
-                },
-                'context': {
-                    'client': merge_dicts(
-                        traverse_obj(client, ('INNERTUBE_CONTEXT', 'client')), {
-                            'hl': 'en',
-                            'timeZone': 'UTC',
-                            'utcOffsetMinutes': 0,
-                        }),
-                },
-                'videoId': video_id,
-            }
+            if is_live and 'ios' not in client_names:
+                client_names.append('ios')
 
-            headers = merge_dicts({
+            headers = {
                 'Sec-Fetch-Mode': 'navigate',
                 'Origin': origin,
-                # 'X-Goog-Visitor-Id': self._extract_visitor_data(ytcfg) or '',
-            }, traverse_obj(client, {
-                'X-YouTube-Client-Name': 'INNERTUBE_CONTEXT_CLIENT_NAME',
-                'X-YouTube-Client-Version': (
-                    'INNERTUBE_CONTEXT', 'client', 'clientVersion'),
-                'User-Agent': (
-                    'INNERTUBE_CONTEXT', 'client', 'userAgent'),
-            }))
-
+                'X-Goog-Visitor-Id': self._extract_visitor_data(ytcfg) or '',
+            }
             auth = self._generate_sapisidhash_header(origin)
             if auth is not None:
                 headers['Authorization'] = auth
                 headers['X-Origin'] = origin
 
-            player_response = self._call_api(
-                'player', query, video_id, fatal=False, headers=headers,
-                note=join_nonempty(
-                    'Downloading', traverse_obj(query, (
-                        'context', 'client', 'clientName')),
-                    'API JSON', delim=' '))
+            for client in traverse_obj(self._INNERTUBE_CLIENTS, (client_names, T(dict))):
+
+                query = {
+                    'playbackContext': {
+                        'contentPlaybackContext': pb_context,
+                    },
+                    'contentCheckOk': True,
+                    'racyCheckOk': True,
+                    'context': {
+                        'client': merge_dicts(
+                            traverse_obj(client, ('INNERTUBE_CONTEXT', 'client')), {
+                                'hl': 'en',
+                                'timeZone': 'UTC',
+                                'utcOffsetMinutes': 0,
+                            }),
+                    },
+                    'videoId': video_id,
+                }
+
+                api_headers = merge_dicts(headers, traverse_obj(client, {
+                    'X-YouTube-Client-Name': 'INNERTUBE_CONTEXT_CLIENT_NAME',
+                    'X-YouTube-Client-Version': (
+                        'INNERTUBE_CONTEXT', 'client', 'clientVersion'),
+                    'User-Agent': (
+                        'INNERTUBE_CONTEXT', 'client', 'userAgent'),
+                }))
+
+                api_player_response = self._call_api(
+                    'player', query, video_id, fatal=False, headers=api_headers,
+                    note=join_nonempty(
+                        'Downloading', traverse_obj(query, (
+                            'context', 'client', 'clientName')),
+                        'API JSON', delim=' '))
+
+                hls = traverse_obj(
+                    (player_response, api_player_response),
+                    (Ellipsis, 'streamingData', 'hlsManifestUrl', T(url_or_none)))
+                if len(hls) == 2 and not hls[0] and hls[1]:
+                    player_response['streamingData']['hlsManifestUrl'] = hls[1]
+                else:
+                    video_details = merge_dicts(*traverse_obj(
+                        (player_response, api_player_response),
+                        (Ellipsis, 'videoDetails', T(dict))))
+                    player_response.update(api_player_response or {})
+                    player_response['videoDetails'] = video_details
 
         def is_agegated(playability):
             if not isinstance(playability, dict):
@@ -2194,6 +2269,7 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         itag_qualities = {}
         q = qualities(['tiny', 'small', 'medium', 'large', 'hd720', 'hd1080', 'hd1440', 'hd2160', 'hd2880', 'highres'])
         CHUNK_SIZE = 10 << 20
+        is_live = video_details.get('isLive')
 
         streaming_data = player_response.get('streamingData') or {}
         streaming_formats = streaming_data.get('formats') or []
@@ -2338,7 +2414,8 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
         hls_manifest_url = streaming_data.get('hlsManifestUrl')
         if hls_manifest_url:
             for f in self._extract_m3u8_formats(
-                    hls_manifest_url, video_id, 'mp4', fatal=False):
+                    hls_manifest_url, video_id, 'mp4',
+                    entry_protocol='m3u8_native', live=is_live, fatal=False):
                 if process_manifest_format(
                         f, 'hls', None, self._search_regex(
                             r'/itag/(\d+)', f['url'], 'itag', default=None)):
@@ -2443,8 +2520,6 @@ class YoutubeIE(YoutubeBaseInfoExtractor):
                     '{0}: Some possibly damaged formats will be deprioritized'.format(video_id), only_once=True)
                 # Strictly de-prioritize damaged formats
                 f['preference'] = -10
-
-        is_live = video_details.get('isLive')
 
         owner_profile_url = self._yt_urljoin(self._extract_author_var(
             webpage, 'url', videodetails=video_details, metadata=microformat))
@@ -3130,8 +3205,12 @@ class YoutubeTabIE(YoutubeBaseInfoExtractor):
             expected_type=txt_or_none)
 
     def _grid_entries(self, grid_renderer):
-        for item in grid_renderer['items']:
-            if not isinstance(item, dict):
+        for item in traverse_obj(grid_renderer, ('items', Ellipsis, T(dict))):
+            lockup_view_model = traverse_obj(item, ('lockupViewModel', T(dict)))
+            if lockup_view_model:
+                entry = self._extract_lockup_view_model(lockup_view_model)
+                if entry:
+                    yield entry
                 continue
             renderer = self._extract_grid_item_renderer(item)
             if not isinstance(renderer, dict):
@@ -3214,6 +3293,25 @@ class YoutubeTabIE(YoutubeBaseInfoExtractor):
             if not video_id:
                 continue
             yield self._extract_video(renderer)
+
+    def _extract_lockup_view_model(self, view_model):
+        content_id = view_model.get('contentId')
+        if not content_id:
+            return
+        content_type = view_model.get('contentType')
+        if content_type not in ('LOCKUP_CONTENT_TYPE_PLAYLIST', 'LOCKUP_CONTENT_TYPE_PODCAST'):
+            self.report_warning(
+                'Unsupported lockup view model content type "{0}"{1}'.format(content_type, bug_reports_message()), only_once=True)
+            return
+        return merge_dicts(self.url_result(
+            update_url_query('https://www.youtube.com/playlist', {'list': content_id}),
+            ie=YoutubeTabIE.ie_key(), video_id=content_id), {
+                'title': traverse_obj(view_model, (
+                    'metadata', 'lockupMetadataViewModel', 'title', 'content', T(compat_str))),
+                'thumbnails': self._extract_thumbnails(view_model, (
+                    'contentImage', 'collectionThumbnailViewModel', 'primaryThumbnail',
+                    'thumbnailViewModel', 'image'), final_key='sources'),
+        })
 
     def _video_entry(self, video_renderer):
         video_id = video_renderer.get('videoId')
@@ -3419,7 +3517,7 @@ class YoutubeTabIE(YoutubeBaseInfoExtractor):
             if not continuation:
                 break
             if visitor_data:
-                headers['x-goog-visitor-id'] = visitor_data
+                headers['X-Goog-Visitor-Id'] = visitor_data
             data['continuation'] = continuation['continuation']
             data['clickTracking'] = {
                 'clickTrackingParams': continuation['itct'],
